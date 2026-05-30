@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: MIT */
 /* Copyright (C) 2026 Interpretica Unipessoal Lda */
 /* Pure, dependency-free ELF memory-map parser core.
  * Architecture/endian/class agnostic: it reads e_ident and interprets
