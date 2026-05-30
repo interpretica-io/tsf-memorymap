@@ -3,11 +3,15 @@
 /** @file
  * @brief The memory map of a running process
  *
- * @c /proc/PID/maps and @c /proc/PID/smaps are read with @c cat rather
- * than fetched as files: they are kernel-generated, report a size of
- * zero, and a file copy would come back empty. The resident size of
- * each mapping is taken from @c smaps, whose blocks begin with the same
- * "start-end perms ..." header line as @c maps and then list @c Rss.
+ * @c /proc/PID/maps and @c /proc/PID/smaps are read on the agent by a
+ * native @c open()/read() over RPC, not by fetching them as files or
+ * running @c cat: they are kernel-generated and report a size of zero,
+ * so a file copy would come back empty, and a read to EOF over RPC
+ * returns a structured result without spawning a process. The resident
+ * size of each mapping is taken from @c smaps, whose blocks begin with
+ * the same "start-end perms ..." header line as @c maps and then list
+ * @c Rss. macOS has no @c /proc, so it still runs the @c vmmap tool
+ * (over a job factory made from the same RPC server).
  */
 
 #define TE_LGR_USER "TAPI MEMMAP"
@@ -18,6 +22,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 
 #include "logger_api.h"
 #include "te_alloc.h"
@@ -25,7 +30,10 @@
 #include "te_string.h"
 #include "te_vector.h"
 
+#include "rcf_rpc.h"
+#include "tapi_rpc_unistd.h"
 #include "tapi_job_opt.h"
+#include "tapi_job_factory_rpc.h"
 #include "tapi_devtool_run.h"
 #include "tapi_memmap.h"
 #include "tapi_memmap_proc.h"
@@ -161,17 +169,39 @@ memmap_parse_header(const char *line, tapi_memmap_mapping *m)
     return true;
 }
 
-/** Read Linux /proc/PID/maps and smaps. */
+/**
+ * Read a kernel-generated file on the agent to EOF over RPC.
+ *
+ * A dead process (no such /proc entry) is not a test failure here, so
+ * the open is awaited: it returns TE_ENOENT rather than aborting.
+ */
 static te_errno
-memmap_linux(tapi_job_factory_t *factory, pid_t pid, int timeout_ms,
-             te_vec *maps)
+memmap_read_proc(rcf_rpc_server *rpcs, const char *path, te_string *out)
+{
+    int fd;
+    te_errno rc;
+
+    RPC_AWAIT_IUT_ERROR(rpcs);
+    fd = rpc_open(rpcs, path, RPC_O_RDONLY, 0);
+    if (fd < 0)
+        return TE_RC(TE_TAPI, TE_ENOENT);
+
+    rc = tapi_rpc_read_fd_to_te_string(rpcs, fd, out);
+
+    RPC_AWAIT_IUT_ERROR(rpcs);
+    rpc_close(rpcs, fd);
+
+    return rc;
+}
+
+/** Read Linux /proc/PID/maps and smaps over RPC. */
+static te_errno
+memmap_linux(rcf_rpc_server *rpcs, pid_t pid, te_vec *maps)
 {
     te_string path = TE_STRING_INIT;
     te_string out = TE_STRING_INIT;
-    const char *args[1];
     const char *line;
     tapi_memmap_mapping *last = NULL;
-    bool ok = false;
     te_errno rc;
 
     /*
@@ -180,22 +210,16 @@ memmap_linux(tapi_job_factory_t *factory, pid_t pid, int timeout_ms,
      * the resident size.
      */
     te_string_append(&path, "/proc/%d/smaps", (int)pid);
-    args[0] = path.ptr;
-    rc = memmap_run(factory, "cat", args, 1, timeout_ms, &out, &ok);
-    if (rc != 0)
-        goto out;
+    rc = memmap_read_proc(rpcs, path.ptr, &out);
 
-    if (!ok || out.len == 0)
+    if (rc != 0 || out.len == 0)
     {
         /* No smaps (or no process): fall back to maps, RSS unknown. */
         te_string_reset(&path);
         te_string_reset(&out);
         te_string_append(&path, "/proc/%d/maps", (int)pid);
-        args[0] = path.ptr;
-        rc = memmap_run(factory, "cat", args, 1, timeout_ms, &out, &ok);
+        rc = memmap_read_proc(rpcs, path.ptr, &out);
         if (rc != 0)
-            goto out;
-        if (!ok)
         {
             rc = TE_RC(TE_TAPI, TE_ENOENT);
             goto out;
@@ -240,15 +264,20 @@ out:
  * to use it on macOS should expect to adjust the parse.
  */
 static te_errno
-memmap_macos(tapi_job_factory_t *factory, pid_t pid, int timeout_ms,
-             te_vec *maps)
+memmap_macos(rcf_rpc_server *rpcs, pid_t pid, int timeout_ms, te_vec *maps)
 {
     te_string out = TE_STRING_INIT;
     te_string pidstr = TE_STRING_INIT;
+    tapi_job_factory_t *factory = NULL;
     const char *args[2];
     const char *line;
     bool ok = false;
     te_errno rc;
+
+    /* No /proc on macOS: run vmmap over a job factory made from the RPC. */
+    rc = tapi_job_factory_rpc_create(rpcs, &factory);
+    if (rc != 0)
+        goto out;
 
     te_string_append(&pidstr, "%d", (int)pid);
     args[0] = "-interleaved";
@@ -308,6 +337,8 @@ memmap_macos(tapi_job_factory_t *factory, pid_t pid, int timeout_ms,
         rc = TE_RC(TE_TAPI, TE_ENOENT);
 
 out:
+    if (factory != NULL)
+        tapi_job_factory_destroy(factory);
     te_string_free(&out);
     te_string_free(&pidstr);
 
@@ -316,35 +347,26 @@ out:
 
 /* See description in tapi_memmap_proc.h */
 te_errno
-tapi_memmap_proc_read(tapi_job_factory_t *factory, pid_t pid, int timeout_ms,
+tapi_memmap_proc_read(rcf_rpc_server *rpcs, pid_t pid, int timeout_ms,
                       te_vec *maps)
 {
-    te_string out = TE_STRING_INIT;
-    const char *uname_args[1] = { "-s" };
-    bool ok = false;
-    te_errno rc;
+    struct utsname uts;
 
-    /* Which OS: uname -s says Linux or Darwin. */
-    rc = memmap_run(factory, "uname", uname_args, 1, timeout_ms, &out, &ok);
-    if (rc != 0)
+    /* Which OS: uname on the agent says Linux or Darwin. */
+    RPC_AWAIT_IUT_ERROR(rpcs);
+    if (rpc_uname(rpcs, &uts) != 0)
     {
-        te_string_free(&out);
-        return rc;
+        ERROR("uname on the agent failed");
+        return TE_RC(TE_TAPI, TE_EFAIL);
     }
 
-    if (strstr(te_string_value(&out), "Linux") != NULL)
-        rc = memmap_linux(factory, pid, timeout_ms, maps);
-    else if (strstr(te_string_value(&out), "Darwin") != NULL)
-        rc = memmap_macos(factory, pid, timeout_ms, maps);
-    else
-    {
-        ERROR("Reading a process map needs Linux or macOS");
-        rc = TE_RC(TE_TAPI, TE_EOPNOTSUPP);
-    }
+    if (strstr(uts.sysname, "Linux") != NULL)
+        return memmap_linux(rpcs, pid, maps);
+    if (strstr(uts.sysname, "Darwin") != NULL)
+        return memmap_macos(rpcs, pid, timeout_ms, maps);
 
-    te_string_free(&out);
-
-    return rc;
+    ERROR("Reading a process map needs Linux or macOS");
+    return TE_RC(TE_TAPI, TE_EOPNOTSUPP);
 }
 
 /* See description in tapi_memmap_proc.h */

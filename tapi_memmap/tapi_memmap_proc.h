@@ -22,7 +22,7 @@
  * te_vec maps = TE_VEC_INIT(tapi_memmap_mapping);
  * const tapi_memmap_mapping *m;
  *
- * CHECK_RC(tapi_memmap_proc_read(factory, pid, 30000, &maps));
+ * CHECK_RC(tapi_memmap_proc_read(rpcs, pid, 30000, &maps));
  * TE_VEC_FOREACH(&maps, m)
  *     if ((m->perms & TAPI_MEMMAP_W) && (m->perms & TAPI_MEMMAP_X))
  *         TEST_VERDICT("A writable, executable mapping at 0x%" PRIx64,
@@ -40,6 +40,7 @@
 #include "te_errno.h"
 #include "te_vector.h"
 #include "tapi_job.h"
+#include "rcf_rpc.h"
 
 #include "tapi_memmap.h"
 
@@ -84,9 +85,13 @@ typedef struct tapi_memmap_mapping {
 /**
  * Read the memory map of a process on the agent.
  *
- * @param[in]  factory      Job factory.
+ * On Linux the agent's @c /proc/PID/{smaps,maps} is read directly over
+ * RPC (a native @c open()/read()); macOS, having no @c /proc, runs the
+ * @c vmmap tool over a job factory made from the same RPC server.
+ *
+ * @param[in]  rpcs         RPC server on the agent.
  * @param[in]  pid          Process id on the agent.
- * @param[in]  timeout_ms   Timeout, ms.
+ * @param[in]  timeout_ms   Timeout for the macOS tool path, ms.
  * @param[out] maps         Vector of #tapi_memmap_mapping to append to;
  *                          release with tapi_memmap_mappings_free().
  *
@@ -94,7 +99,7 @@ typedef struct tapi_memmap_mapping {
  * @retval TE_ENOENT        There is no such process.
  * @retval TE_EOPNOTSUPP    The agent is neither Linux nor macOS.
  */
-extern te_errno tapi_memmap_proc_read(tapi_job_factory_t *factory, pid_t pid,
+extern te_errno tapi_memmap_proc_read(rcf_rpc_server *rpcs, pid_t pid,
                                       int timeout_ms, te_vec *maps);
 
 /**

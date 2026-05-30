@@ -35,6 +35,7 @@ sources += files(
 te_libs += [
     'tapi',
     'tapi_job',
+    'tapi_rpc',
     'tapi_devtool',
     'tapi_cybersec',
 ]
